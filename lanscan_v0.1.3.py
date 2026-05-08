@@ -204,6 +204,22 @@ def _iface_ip_mask(iface):
     return None, None
 
 
+def _find_iface_for_ip(ip_str):
+    """從 ifconfig 輸出找到擁有指定 IP 的介面名稱"""
+    try:
+        r = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=5)
+        current_iface = None
+        for line in r.stdout.splitlines():
+            if not line.startswith((" ", "\t")):
+                current_iface = line.split(":")[0].split()[0]
+            elif ip_str in line and "inet " in line:
+                dbg(f"_find_iface_for_ip({ip_str}) -> {current_iface}")
+                return current_iface
+    except Exception as e:
+        dbg(f"_find_iface_for_ip failed: {e}")
+    return None
+
+
 def get_local_network():
     dbg("=== 偵測本地網段 ===")
     iface = get_default_interface()
@@ -283,13 +299,15 @@ def find_source_ip_for_network(network_cidr):
 
 def check_route_to_network(network_cidr):
     """
-    簡單驗證是否能路由到目標網段。
+    簡單驗證是否能路由到目標網段（使用 SOURCE_IP 綁定若已設定）。
     回傳 (reachable: bool, source_ip: str | None, warning_msg: str | None)
     """
     target_net = ipaddress.IPv4Network(network_cidr, strict=False)
     first_host = str(next(target_net.hosts()))
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            if SOURCE_IP:
+                s.bind((SOURCE_IP, 0))
             s.connect((first_host, 1))
             src = s.getsockname()[0]
             if src == "0.0.0.0":
@@ -794,21 +812,31 @@ def main():
             print("\n[!] 無法自動偵測網段，請使用 -n 參數指定")
             sys.exit(1)
 
-    # ── 路由檢查 + 來源 IP ──
+    # ── 來源 IP 自動偵測（無論 -n 是否指定都執行）──
     if SOURCE_IP is None:
         auto_src = find_source_ip_for_network(network_cidr)
         if auto_src:
             SOURCE_IP = auto_src
-            if local_ip == "N/A":
-                local_ip = auto_src
+            dbg(f"auto source IP: {SOURCE_IP}")
+        else:
+            print(f"\n  \033[93m[!] 無法自動偵測 {network_cidr} 的來源 IP\033[0m")
+            print(f"      請執行: ifconfig | grep inet")
+            print(f"      再使用: --source-ip <你的IP>")
 
-    reachable, udp_src, warn_msg = check_route_to_network(network_cidr)
+    # 用 source IP 補全 local_ip 與 iface（當 -n 指定時 N/A）
+    if SOURCE_IP and local_ip == "N/A":
+        local_ip = SOURCE_IP
+    if SOURCE_IP and iface == "N/A":
+        iface = _find_iface_for_ip(SOURCE_IP) or "auto"
+
+    # ── 路由可達性檢查 ──
+    reachable, _, warn_msg = check_route_to_network(network_cidr)
     if not reachable:
         print(f"\n  \033[91m[!] 路由問題偵測到：\033[0m")
         for line in warn_msg.splitlines():
             print(f"  {line}")
         if SOURCE_IP:
-            print(f"\n  [*] 將使用 --source-ip {SOURCE_IP} 強制綁定，繼續嘗試...")
+            print(f"\n  [*] 將使用 source-ip={SOURCE_IP} 強制綁定，繼續嘗試...")
         else:
             print(f"\n  [*] 嘗試繼續掃描（可能仍會失敗）...")
 
