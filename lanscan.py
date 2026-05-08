@@ -155,8 +155,11 @@ def arp_scan(network_cidr, timeout=3):
 
     try:
         result, _ = srp(packet, timeout=timeout, verbose=False)
-    except PermissionError:
-        print("  [!] ARP 掃描需要 root 權限，改用 Ping 掃描")
+    except (PermissionError, OSError, Exception) as e:
+        if "ermission" in str(e) or "root" in str(e).lower() or "bpf" in str(e).lower():
+            print("  [!] ARP 掃描需要 root 權限，改用 Ping 掃描")
+        else:
+            print(f"  [!] ARP 掃描失敗 ({e})，改用 Ping 掃描")
         return ping_scan(network_cidr)
 
     hosts = []
