@@ -4,10 +4,12 @@ LAN Proxy Scanner - 區域網路住宅代理節點偵測工具
 掃描區域網路活躍主機，識別設備資訊與代理風險評估
 """
 
+import select
+import errno as _errno
 import socket
 import struct
-import fcntl
 import ipaddress
+import platform
 import threading
 import time
 import sys
@@ -91,55 +93,97 @@ RISK_WEIGHTS = {"CRITICAL": 40, "HIGH": 20, "MEDIUM": 10, "LOW": 2}
 
 # ─── 網路工具 ─────────────────────────────────────────────────────────────────
 
-def get_default_interface():
-    """取得預設網路介面名稱"""
+def _local_ip_udp():
+    """UDP trick: 連向外部 IP 取得本機出口 IP（不實際送出封包）"""
     try:
-        result = subprocess.run(
-            ["ip", "route", "show", "default"],
-            capture_output=True, text=True, timeout=5
-        )
-        for line in result.stdout.splitlines():
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return None
+
+
+def get_default_interface():
+    """取得預設路由使用的網路介面名稱（Linux / macOS）"""
+    # Linux: ip route show default
+    try:
+        r = subprocess.run(["ip", "route", "show", "default"],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
             parts = line.split()
             if "dev" in parts:
                 return parts[parts.index("dev") + 1]
     except Exception:
         pass
-    return "eth0"
-
-
-def get_interface_info(iface):
-    """取得網路介面的 IP 與子網路遮罩"""
+    # macOS: route -n get default
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        ip_raw = fcntl.ioctl(
-            sock.fileno(), 0x8915,
-            struct.pack("256s", iface[:15].encode("utf-8"))
-        )
-        ip = socket.inet_ntoa(ip_raw[20:24])
-
-        mask_raw = fcntl.ioctl(
-            sock.fileno(), 0x891b,
-            struct.pack("256s", iface[:15].encode("utf-8"))
-        )
-        mask = socket.inet_ntoa(mask_raw[20:24])
-        return ip, mask
+        r = subprocess.run(["route", "-n", "get", "default"],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("interface:"):
+                return line.split(":")[-1].strip()
     except Exception:
-        return None, None
+        pass
+    return None
+
+
+def _iface_ip_mask(iface):
+    """從 ifconfig 取得介面 IP 與子網路遮罩（Linux / macOS）"""
+    try:
+        r = subprocess.run(["ifconfig", iface],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line.startswith("inet ") or ":" in line.split()[1]:
+                continue
+            # Linux:  inet 10.0.0.5  netmask 255.255.255.0 ...
+            # macOS:  inet 10.0.0.5 netmask 0xffffff00 broadcast ...
+            parts = line.split()
+            ip = parts[1]
+            if "netmask" in parts:
+                idx = parts.index("netmask")
+                raw = parts[idx + 1]
+                if raw.startswith("0x"):
+                    mask = socket.inet_ntoa(struct.pack(">I", int(raw, 16)))
+                else:
+                    mask = raw
+                return ip, mask
+    except Exception:
+        pass
+
+    # Linux fallback: ip addr show
+    try:
+        r = subprocess.run(["ip", "addr", "show", iface],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("inet ") and "/" in line:
+                addr_pfx = line.split()[1]
+                ip, pfx = addr_pfx.split("/")
+                mask_int = (0xFFFFFFFF << (32 - int(pfx))) & 0xFFFFFFFF
+                mask = socket.inet_ntoa(struct.pack(">I", mask_int))
+                return ip, mask
+    except Exception:
+        pass
+    return None, None
 
 
 def get_local_network():
-    """自動偵測本地網段"""
+    """自動偵測本地網段（跨平台：Linux / macOS）"""
     iface = get_default_interface()
-    ip, mask = get_interface_info(iface)
-    if ip and mask:
-        network = ipaddress.IPv4Network(f"{ip}/{mask}", strict=False)
-        return str(network), ip, iface
-    # fallback：嘗試常見介面
-    for iface in ["eth0", "eth1", "wlan0", "ens33", "ens3", "enp0s3"]:
-        ip, mask = get_interface_info(iface)
+    if iface:
+        ip, mask = _iface_ip_mask(iface)
         if ip and mask:
             network = ipaddress.IPv4Network(f"{ip}/{mask}", strict=False)
             return str(network), ip, iface
+
+    # 最終 fallback：UDP trick 取 IP，假設 /24
+    local_ip = _local_ip_udp()
+    if local_ip:
+        network = ipaddress.IPv4Network(f"{local_ip}/24", strict=False)
+        return str(network), local_ip, iface or "auto"
+
     return None, None, None
 
 
@@ -246,20 +290,44 @@ def get_mac_vendor(mac, cache={}):
 # ─── 埠口掃描 ─────────────────────────────────────────────────────────────────
 
 def scan_port(ip, port, timeout=1.0):
-    """TCP connect 掃描單一埠口"""
+    """TCP connect 掃描單一埠口（non-blocking + select，跨平台可靠）"""
+    s = None
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(timeout)
-            s.connect((ip, port))  # 連線成功則繼續，失敗則拋出例外
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setblocking(False)
+        err = s.connect_ex((ip, port))
+
+        if err == 0:
+            connected = True
+        elif err in (_errno.EINPROGRESS, _errno.EWOULDBLOCK,
+                     getattr(_errno, "WSAEWOULDBLOCK", 10035)):
+            # 等待 socket 變成可寫（即連線完成或失敗）
+            _, writable, _ = select.select([], [s], [], timeout)
+            if writable:
+                so_err = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                connected = (so_err == 0)
+            else:
+                connected = False  # timeout
+        else:
+            connected = False
+
+        if connected:
             banner = ""
             try:
+                s.settimeout(0.5)
                 s.send(b"HEAD / HTTP/1.0\r\n\r\n")
                 banner = s.recv(64).decode("utf-8", errors="ignore").split("\n")[0].strip()
             except Exception:
                 pass
             return True, banner
-    except (socket.timeout, ConnectionRefusedError, OSError):
+    except Exception:
         pass
+    finally:
+        if s:
+            try:
+                s.close()
+            except Exception:
+                pass
     return False, ""
 
 
