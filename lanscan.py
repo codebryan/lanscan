@@ -250,16 +250,15 @@ def scan_port(ip, port, timeout=1.0):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
-            result = s.connect_ex((ip, port))
-            if result == 0:
-                banner = ""
-                try:
-                    s.send(b"HEAD / HTTP/1.0\r\n\r\n")
-                    banner = s.recv(64).decode("utf-8", errors="ignore").split("\n")[0].strip()
-                except Exception:
-                    pass
-                return True, banner
-    except Exception:
+            s.connect((ip, port))  # 連線成功則繼續，失敗則拋出例外
+            banner = ""
+            try:
+                s.send(b"HEAD / HTTP/1.0\r\n\r\n")
+                banner = s.recv(64).decode("utf-8", errors="ignore").split("\n")[0].strip()
+            except Exception:
+                pass
+            return True, banner
+    except (socket.timeout, ConnectionRefusedError, OSError):
         pass
     return False, ""
 
